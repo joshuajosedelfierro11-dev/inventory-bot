@@ -1,6 +1,6 @@
 from flask import Flask, request, render_template_string
 from openai import OpenAI
-import os, json, datetime, collections
+import os, json, datetime, collections, re
 
 client = OpenAI(api_key=os.getenv("OPENAI_INVENTORY_KEY"))
 
@@ -12,23 +12,13 @@ MIN_FILE="min_levels.json"
 CAT_FILE="categories.json"
 HISTORY_FILE="stock_history.json"
 SUP_FILE="suppliers.json"
+PRICE_FILE="price_list.json"
 
-SYSTEM_PROMPT = """
-You are Stocky, a polite inventory assistant.
-Return ONLY valid JSON.
-
-Actions:
-add, sell, setmin, setcat, setsupplier
-
-add/sell:
-{"action":"add|sell","item":"string","qty":number,"price":number,"reply":"string"}
-"""
-
-# ---------------- HTML ----------------
-
+# ---- PASTE YOUR HTML HERE ----
 MAIN_HTML = """
 <!doctype html>
-<html><head>
+<html>
+<head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Mr AI Inventory</title>
 <style>
@@ -45,7 +35,9 @@ th{background:#f8fafc;padding:10px;text-align:left}
 td{padding:10px;border-top:1px solid #e5e7eb}
 .low{background:#fecaca;color:#7f1d1d;padding:4px 10px;border-radius:999px}
 .ok{background:#bbf7d0;color:#065f46;padding:4px 10px;border-radius:999px}
-</style></head><body>
+</style>
+</head>
+<body>
 
 <div class="header">📦 Mr AI Inventory Dashboard</div>
 <div class="container">
@@ -103,9 +95,16 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <td>{{ item }}</td>
 <td>{{ categories.get(item,"-") }}</td>
 <td>{{ suppliers.get(item,{}).get("name","-") }}</td>
-<td>{% if qty <= min_levels.get(item,5) %}<span class="low">{{ qty }}</span>{% else %}<span class="ok">{{ qty }}</span>{% endif %}</td>
+<td>
+{% if qty <= min_levels.get(item,5) %}
+<span class="low">{{ qty }}</span>
+{% else %}
+<span class="ok">{{ qty }}</span>
+{% endif %}
+</td>
 <td>{{ min_levels.get(item,5) }}</td>
-</tr>{% endfor %}
+</tr>
+{% endfor %}
 </table>
 </div>
 
@@ -114,12 +113,20 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <table>
 <tr><th>Time</th><th>Item</th><th>Action</th><th>Qty</th><th>Price</th></tr>
 {% for h in history %}
-<tr><td>{{ h.time }}</td><td>{{ h.item }}</td><td>{{ h.action }}</td><td>{{ h.qty }}</td><td>{{ h.get("price",0) }}</td></tr>
+<tr>
+<td>{{ h["time"] }}</td>
+<td>{{ h["item"] }}</td>
+<td>{{ h["action"] }}</td>
+<td>{{ h["qty"] }}</td>
+<td>{{ h.get("price",0) }}</td>
+</tr>
 {% endfor %}
 </table>
 </div>
 
-</div></body></html>
+</div>
+</body>
+</html>
 """
 
 DASHBOARD_HTML = """
@@ -159,9 +166,13 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <div class="card">
 <h3>🏷 Price List Tracker</h3>
 <table>
-<tr><th>Item</th><th>Last Sold Price</th></tr>
+<tr><th>Item</th><th>Last Bought Price</th><th>Last Sold Price</th></tr>
 {% for i,p in price_list.items() %}
-<tr><td>{{ i }}</td><td>₱{{ p }}</td></tr>
+<tr>
+<td>{{ i }}</td>
+<td>₱{{ prices.get(i,{}).get("buy",0) }}</td>
+<td>₱{{ p }}</td>
+</tr>
 {% endfor %}
 </table>
 </div>
@@ -195,7 +206,15 @@ td{padding:14px;border-top:1px solid #ddd}
 </div></body></html>
 """
 
-# ---------------- HELPERS ----------------
+SYSTEM_PROMPT = """
+You are Stocky, a friendly Filipino store assistant.
+
+Always output VALID JSON ONLY.
+
+Format:
+{"actions":[{"action":"add|sell|setmin|setcat|setsupplier",
+"item":"","qty":0,"price":0,"category":"","supplier":"","contact":"string or empty","reply":""}]}
+"""
 
 def load(p):
     if not os.path.exists(p): return {} if p!=HISTORY_FILE else []
@@ -207,9 +226,14 @@ def save(p,d):
 
 def log(item,action,qty,price=0):
     hist=load(HISTORY_FILE)
-    hist.append({"time":str(datetime.datetime.now()),"item":item,
-                 "action":action,"qty":qty,"price":price})
+    hist.append({"time":str(datetime.datetime.now()),"item":item,"action":action,"qty":qty,"price":price})
     save(HISTORY_FILE,hist)
+
+def update_price(item, price, mode):
+    prices=load(PRICE_FILE)
+    prices.setdefault(item,{"buy":0,"sell":0})
+    prices[item][mode]=price
+    save(PRICE_FILE,prices)
 
 def smart_reorder(inv,mins,hist):
     recent={}
@@ -218,64 +242,131 @@ def smart_reorder(inv,mins,hist):
             recent[h["item"]]=recent.get(h["item"],0)+h.get("qty",0)
     return {i:max(5,recent[i]//7*10) for i,q in inv.items() if q<=mins.get(i,5) and i in recent}
 
-# ---------------- ROUTES ----------------
+def resolve_item_keyword(word,inventory):
+    word=word.lower()
+    matches=[i for i in inventory if i.lower().startswith(word)]
+    return matches[0] if matches else word
+
+def resolve_copy_commands(text,cats,sups):
+    text=text.lower()
+    acts=[]
+    def before(k): return text.split(k)[0].strip().split()[-1]
+    def after(k): return text.split(k)[1].strip().split()[0]
+
+    for k in ["same category as","same category with"]:
+        if k in text:
+            item,ref=before(k),after(k)
+            if ref in cats:
+                acts.append({"action":"setcat","item":item,"category":cats[ref],
+                "qty":0,"price":0,"supplier":"","contact":"",
+                "reply":f"{item} now uses same category as {ref}."})
+
+    for k in ["same supplier as","same supplier with"]:
+        if k in text:
+            item,ref=before(k),after(k)
+            if ref in sups:
+                acts.append({"action":"setsupplier","item":item,
+                "supplier":sups[ref]["name"],"contact":sups[ref].get("contact",""),
+                "qty":0,"price":0,"category":"",
+                "reply":f"{item} now uses same supplier as {ref}."})
+    return acts
+
+def detect_stock_query(text,inv):
+    text=text.lower()
+    patterns=[
+        r"how many\s+(\w+)",
+        r"(\w+)\s+left",
+        r"remaining\s+(\w+)",
+        r"stock\s+of\s+(\w+)",
+        r"(\w+)\?$"
+    ]
+    for p in patterns:
+        m=re.search(p,text)
+        if m:
+            key=m.group(1)
+            item=resolve_item_keyword(key,inv)
+            return item,inv.get(item,0)
+    return None,None
 
 @app.route("/",methods=["GET","POST"])
 def home():
-    inv,mins,cats,sups,hist = load(FILE),load(MIN_FILE),load(CAT_FILE),load(SUP_FILE),load(HISTORY_FILE)
-    last_hist = hist[-15:]
+    inv,mins,cats,sups,hist,prices=load(FILE),load(MIN_FILE),load(CAT_FILE),load(SUP_FILE),load(HISTORY_FILE),load(PRICE_FILE)
+    last_hist=hist[-15:]
     alerts=[i for i,q in inv.items() if q<=mins.get(i,5)]
     reorders=smart_reorder(inv,mins,hist)
-    profit=sum(h.get("price",0)*h.get("qty",0) for h in hist if h.get("action")=="OUT")
+    profit=sum((h["price"]-prices.get(h["item"],{}).get("buy",0))*h["qty"]
+        for h in hist if h.get("action")=="OUT")
     reply=""
 
     if request.method=="POST":
-        try:
-            ai=client.responses.create(model="gpt-4.1-mini",input=[
-                {"role":"system","content":SYSTEM_PROMPT},
-                {"role":"user","content":request.form["msg"]}
-            ]).output_text
-            d=json.loads(ai)
+        text=request.form["msg"]
 
-            if d["action"]=="add":
-                inv[d["item"]]=inv.get(d["item"],0)+int(d["qty"])
-                log(d["item"],"IN",d["qty"],d.get("price",0))
-            if d["action"]=="sell":
-                inv[d["item"]]=inv.get(d["item"],0)-int(d["qty"])
-                log(d["item"],"OUT",d["qty"],d.get("price",0))
-            if d["action"]=="setmin": mins[d["item"]]=int(d["qty"])
-            if d["action"]=="setcat": cats[d["item"]]=d["category"]
-            if d["action"]=="setsupplier": sups[d["item"]]={"name":d["supplier"],"contact":d["contact"]}
+        item,qty=detect_stock_query(text,inv)
+        if item:
+            reply=f"📦 You have {qty} stocks left for {item}."
+        else:
+            try:
+                copied=resolve_copy_commands(text,cats,sups)
+                ai=client.responses.create(model="gpt-4.1-mini",input=[
+                    {"role":"system","content":SYSTEM_PROMPT},
+                    {"role":"user","content":text}
+                ]).output_text
 
-            save(FILE,inv); save(MIN_FILE,mins); save(CAT_FILE,cats); save(SUP_FILE,sups)
-            reply=d.get("reply","Updated.")
-        except:
-            reply="Try: Sold 3 coke at 20 pesos"
+                data=json.loads(ai)
+                data["actions"]+=copied
 
-    return render_template_string(MAIN_HTML,reply=reply,inventory=inv,min_levels=mins,
-        categories=cats,suppliers=sups,history=last_hist,alerts=alerts,reorders=reorders,profit=profit)
+                for d in data["actions"]:
+                    if d.get("item"):
+                        d["item"]=resolve_item_keyword(d["item"],inv)
+
+                    if d["action"]=="add":
+                        inv[d["item"]]=inv.get(d["item"],0)+int(d["qty"])
+                        update_price(d["item"],d["price"],"buy")
+                        log(d["item"],"IN",d["qty"],d["price"])
+                    elif d["action"]=="sell":
+                        inv[d["item"]]=inv.get(d["item"],0)-int(d["qty"])
+                        update_price(d["item"],d["price"],"sell")
+                        log(d["item"],"OUT",d["qty"],d["price"])
+                    elif d["action"]=="setcat":
+                        cats[d["item"]]=d["category"]
+                    elif d["action"]=="setsupplier":
+                        sups[d["item"]]={"name":d.get("supplier",""),"contact":d.get("contact","")}
+
+                save(FILE,inv);save(MIN_FILE,mins);save(CAT_FILE,cats);save(SUP_FILE,sups)
+                reply=data["actions"][0]["reply"]
+            except:
+                reply="Try: coke left? or sold 2 cok"
+
+    return render_template_string(MAIN_HTML,reply=reply,inventory=inv,
+        min_levels=mins,categories=cats,suppliers=sups,
+        history=last_hist,alerts=alerts,reorders=reorders,profit=profit)
 
 @app.route("/dashboard")
 def dashboard():
     hist=load(HISTORY_FILE)
+    prices=load(PRICE_FILE)
     counter=collections.Counter(h["item"] for h in hist if h.get("action")=="OUT")
-
     profit_table={}
     price_list={}
     for h in hist:
         if h.get("action")=="OUT":
             i=h["item"]
             profit_table.setdefault(i,{"qty":0,"profit":0})
-            profit_table[i]["qty"]+=h.get("qty",0)
-            profit_table[i]["profit"]+=h.get("qty",0)*h.get("price",0)
-            price_list[i]=h.get("price",0)
+            buy=prices.get(i,{}).get("buy",0)
+            profit_table[i]["qty"]+=h["qty"]
+            profit_table[i]["profit"]+=(h["price"]-buy)*h["qty"]
+            price_list[i]=h["price"]
 
-    return render_template_string(DASHBOARD_HTML,
-        top_items=counter.most_common(5),
-        monthly=len(hist),
-        turnover=sum(counter.values()),
-        profit_table=profit_table,
-        price_list=price_list)
+    return render_template_string(
+    DASHBOARD_HTML,
+    top_items=counter.most_common(5),
+    monthly=len(hist),
+    turnover=sum(counter.values()),
+    profit_table=profit_table,
+    price_list=price_list,
+    prices=prices
+)
+
 
 @app.route("/suppliers")
 def suppliers():
