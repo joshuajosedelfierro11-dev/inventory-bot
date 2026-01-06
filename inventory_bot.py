@@ -15,23 +15,13 @@ SUP_FILE="suppliers.json"
 
 SYSTEM_PROMPT = """
 You are Stocky, a polite inventory assistant.
-
 Return ONLY valid JSON.
 
 Actions:
 add, sell, setmin, setcat, setsupplier
 
 add/sell:
-{"action":"add|sell","item":"string","qty":number,"reply":"string"}
-
-setmin:
-{"action":"setmin","item":"string","qty":number,"reply":"string"}
-
-setcat:
-{"action":"setcat","item":"string","category":"string","reply":"string"}
-
-setsupplier:
-{"action":"setsupplier","item":"string","supplier":"string","contact":"string","reply":"string"}
+{"action":"add|sell","item":"string","qty":number,"price":number,"reply":"string"}
 """
 
 # ---------------- HTML ----------------
@@ -64,11 +54,26 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <div class="alert">⚠ Low stock: {{ alerts }}</div>
 {% endif %}
 
+{% if reorders %}
+<div class="alert" style="background:#dcfce7;color:#065f46">
+🔁 Smart Reorder Suggestions:
+{% for i,q in reorders.items() %}
+<br>• {{ i }} → reorder {{ q }} units
+{% endfor %}
+</div>
+{% endif %}
+
+{% if profit is not none %}
+<div class="alert" style="background:#e0f2fe;color:#075985">
+💰 Total Profit: ₱{{ profit }}
+</div>
+{% endif %}
+
 <div class="grid">
 <div class="card">
 <h3>Command Center</h3>
 <form method="post">
-<input name="msg" placeholder="We received 10 coke today">
+<input name="msg" placeholder="Sold 3 coke at 20 pesos">
 <button>Submit</button>
 </form>
 <p>{{ reply }}</p>
@@ -80,8 +85,8 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <h3>Keyword Guide</h3>
 <table>
 <tr><th>Type</th><th>Result</th></tr>
-<tr><td>We received 10 coke</td><td>Add stock</td></tr>
-<tr><td>Sold 3 bottled water</td><td>Deduct stock</td></tr>
+<tr><td>We received 10 coke at 15 pesos</td><td>Add stock</td></tr>
+<tr><td>Sold 3 coke at 20 pesos</td><td>Deduct stock</td></tr>
 <tr><td>Set minimum coke to 15</td><td>Low-stock alert</td></tr>
 <tr><td>Set category coke to Drinks</td><td>Assign category</td></tr>
 <tr><td>Set supplier coke to ABC Corp contact 09171234567</td><td>Assign supplier</td></tr>
@@ -107,9 +112,9 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <div class="card">
 <h3>Stock History</h3>
 <table>
-<tr><th>Time</th><th>Item</th><th>Action</th><th>Qty</th></tr>
+<tr><th>Time</th><th>Item</th><th>Action</th><th>Qty</th><th>Price</th></tr>
 {% for h in history %}
-<tr><td>{{ h.time }}</td><td>{{ h.item }}</td><td>{{ h.action }}</td><td>{{ h.qty }}</td></tr>
+<tr><td>{{ h.time }}</td><td>{{ h.item }}</td><td>{{ h.action }}</td><td>{{ h.qty }}</td><td>{{ h.get("price",0) }}</td></tr>
 {% endfor %}
 </table>
 </div>
@@ -127,6 +132,9 @@ body{font-family:Segoe UI;background:#f1f5f9;margin:0}
 .card{background:white;border-radius:16px;padding:25px;margin-bottom:20px;
 box-shadow:0 10px 30px rgba(0,0,0,.12)}
 .grid{display:grid;grid-template-columns:repeat(3,1fr);gap:20px}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th{background:#f8fafc;padding:10px;text-align:left}
+td{padding:10px;border-top:1px solid #e5e7eb}
 </style></head><body>
 
 <div class="header">📊 Mr AI Sales Intelligence</div>
@@ -138,8 +146,27 @@ box-shadow:0 10px 30px rgba(0,0,0,.12)}
 <div class="card"><h3>🔁 Inventory Turnover</h3><p>{{ turnover }}</p></div>
 </div>
 
-<a href="/"><button style="padding:14px;background:#2563eb;color:white;border:none;border-radius:10px">⬅ Back</button></a>
+<div class="card">
+<h3>💰 Profit Tracker</h3>
+<table>
+<tr><th>Item</th><th>Total Qty Sold</th><th>Total Profit</th></tr>
+{% for i,d in profit_table.items() %}
+<tr><td>{{ i }}</td><td>{{ d.qty }}</td><td>₱{{ d.profit }}</td></tr>
+{% endfor %}
+</table>
+</div>
 
+<div class="card">
+<h3>🏷 Price List Tracker</h3>
+<table>
+<tr><th>Item</th><th>Last Sold Price</th></tr>
+{% for i,p in price_list.items() %}
+<tr><td>{{ i }}</td><td>₱{{ p }}</td></tr>
+{% endfor %}
+</table>
+</div>
+
+<a href="/"><button style="padding:14px;background:#2563eb;color:white;border:none;border-radius:10px">⬅ Back</button></a>
 </div></body></html>
 """
 
@@ -158,20 +185,13 @@ td{padding:14px;border-top:1px solid #ddd}
 
 <div class="header">🏭 Supplier Management</div>
 <div class="container">
-
 <table>
 <tr><th>Item</th><th>Supplier</th><th>Contact Number</th></tr>
 {% for i,s in suppliers.items() %}
-<tr>
-<td>{{ i }}</td>
-<td>{{ s["name"] }}</td>
-<td>{{ s["contact"] }}</td>
-</tr>
+<tr><td>{{ i }}</td><td>{{ s["name"] }}</td><td>{{ s["contact"] }}</td></tr>
 {% endfor %}
 </table>
-
 <a href="/"><button style="margin-top:20px;padding:14px;background:#4c1d95;color:white;border:none;border-radius:10px">⬅ Back</button></a>
-
 </div></body></html>
 """
 
@@ -182,12 +202,21 @@ def load(p):
     try: return json.load(open(p))
     except: return {} if p!=HISTORY_FILE else []
 
-def save(p,d): open(p,"w").write(json.dumps(d,indent=2))
+def save(p,d):
+    with open(p,"w") as f: json.dump(d,f,indent=2)
 
-def log(item,action,qty):
+def log(item,action,qty,price=0):
     hist=load(HISTORY_FILE)
-    hist.append({"time":str(datetime.datetime.now()),"item":item,"action":action,"qty":qty})
+    hist.append({"time":str(datetime.datetime.now()),"item":item,
+                 "action":action,"qty":qty,"price":price})
     save(HISTORY_FILE,hist)
+
+def smart_reorder(inv,mins,hist):
+    recent={}
+    for h in hist:
+        if h.get("action")=="OUT":
+            recent[h["item"]]=recent.get(h["item"],0)+h.get("qty",0)
+    return {i:max(5,recent[i]//7*10) for i,q in inv.items() if q<=mins.get(i,5) and i in recent}
 
 # ---------------- ROUTES ----------------
 
@@ -195,8 +224,10 @@ def log(item,action,qty):
 def home():
     inv,mins,cats,sups,hist = load(FILE),load(MIN_FILE),load(CAT_FILE),load(SUP_FILE),load(HISTORY_FILE)
     last_hist = hist[-15:]
+    alerts=[i for i,q in inv.items() if q<=mins.get(i,5)]
+    reorders=smart_reorder(inv,mins,hist)
+    profit=sum(h.get("price",0)*h.get("qty",0) for h in hist if h.get("action")=="OUT")
     reply=""
-    alerts=[i for i,q in inv.items() if q <= mins.get(i,5)]
 
     if request.method=="POST":
         try:
@@ -206,8 +237,12 @@ def home():
             ]).output_text
             d=json.loads(ai)
 
-            if d["action"]=="add": inv[d["item"]]=inv.get(d["item"],0)+int(d["qty"]); log(d["item"],"IN",d["qty"])
-            if d["action"]=="sell": inv[d["item"]]=inv.get(d["item"],0)-int(d["qty"]); log(d["item"],"OUT",d["qty"])
+            if d["action"]=="add":
+                inv[d["item"]]=inv.get(d["item"],0)+int(d["qty"])
+                log(d["item"],"IN",d["qty"],d.get("price",0))
+            if d["action"]=="sell":
+                inv[d["item"]]=inv.get(d["item"],0)-int(d["qty"])
+                log(d["item"],"OUT",d["qty"],d.get("price",0))
             if d["action"]=="setmin": mins[d["item"]]=int(d["qty"])
             if d["action"]=="setcat": cats[d["item"]]=d["category"]
             if d["action"]=="setsupplier": sups[d["item"]]={"name":d["supplier"],"contact":d["contact"]}
@@ -215,17 +250,32 @@ def home():
             save(FILE,inv); save(MIN_FILE,mins); save(CAT_FILE,cats); save(SUP_FILE,sups)
             reply=d.get("reply","Updated.")
         except:
-            reply="Try: We received 10 coke"
+            reply="Try: Sold 3 coke at 20 pesos"
 
-    return render_template_string(MAIN_HTML,reply=reply,inventory=inv,min_levels=mins,categories=cats,suppliers=sups,history=last_hist,alerts=alerts)
+    return render_template_string(MAIN_HTML,reply=reply,inventory=inv,min_levels=mins,
+        categories=cats,suppliers=sups,history=last_hist,alerts=alerts,reorders=reorders,profit=profit)
 
 @app.route("/dashboard")
 def dashboard():
     hist=load(HISTORY_FILE)
-    counter=collections.Counter(h["item"] for h in hist if h["action"]=="OUT")
-    monthly=len(hist)
-    turnover=sum(counter.values())
-    return render_template_string(DASHBOARD_HTML,top_items=counter.most_common(5),monthly=monthly,turnover=turnover)
+    counter=collections.Counter(h["item"] for h in hist if h.get("action")=="OUT")
+
+    profit_table={}
+    price_list={}
+    for h in hist:
+        if h.get("action")=="OUT":
+            i=h["item"]
+            profit_table.setdefault(i,{"qty":0,"profit":0})
+            profit_table[i]["qty"]+=h.get("qty",0)
+            profit_table[i]["profit"]+=h.get("qty",0)*h.get("price",0)
+            price_list[i]=h.get("price",0)
+
+    return render_template_string(DASHBOARD_HTML,
+        top_items=counter.most_common(5),
+        monthly=len(hist),
+        turnover=sum(counter.values()),
+        profit_table=profit_table,
+        price_list=price_list)
 
 @app.route("/suppliers")
 def suppliers():
