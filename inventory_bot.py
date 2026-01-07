@@ -1,20 +1,29 @@
-from flask import Flask, request, render_template_string
+from flask import Flask, request, render_template_string, send_file
 from openai import OpenAI
-import os, json, datetime, collections, re
+import os, json, datetime, collections
+from openpyxl import Workbook
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib import colors
 
 client = OpenAI(api_key=os.getenv("OPENAI_INVENTORY_KEY"))
 
 app = Flask(__name__)
 app.secret_key = "inventory_secret"
 
-FILE="inventory.json"
-MIN_FILE="min_levels.json"
-CAT_FILE="categories.json"
-HISTORY_FILE="stock_history.json"
-SUP_FILE="suppliers.json"
-PRICE_FILE="price_list.json"
+# ---------- STORAGE ----------
+BASE = "/data/" if os.path.exists("/data") else "./data/"
+os.makedirs(BASE, exist_ok=True)
 
-# ---- PASTE YOUR HTML HERE ----
+FILE = BASE+"inventory.json"
+MIN_FILE = BASE+"min_levels.json"
+CAT_FILE = BASE+"categories.json"
+HISTORY_FILE = BASE+"stock_history.json"
+SUP_FILE = BASE+"suppliers.json"
+PRICE_FILE = BASE+"price_list.json"
+
+# ---------- HTML ----------
+# KEEP YOUR HTML AS IS
 MAIN_HTML = """
 <!doctype html>
 <html>
@@ -42,11 +51,11 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <div class="header">📦 Mr AI Inventory Dashboard</div>
 <div class="container">
 
-{% if alerts %}
+{% if alerts is defined and alerts %}
 <div class="alert">⚠ Low stock: {{ alerts }}</div>
 {% endif %}
 
-{% if reorders %}
+{% if reorders is defined and reorders %}
 <div class="alert" style="background:#dcfce7;color:#065f46">
 🔁 Smart Reorder Suggestions:
 {% for i,q in reorders.items() %}
@@ -69,6 +78,7 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 <button>Submit</button>
 </form>
 <p>{{ reply }}</p>
+<a href="/report"><button style="background:#065f46">📅 Daily / Weekly Report</button></a>
 <a href="/dashboard"><button style="background:#16a34a">📊 View Sales Dashboard</button></a>
 <a href="/suppliers"><button style="background:#9333ea">🏭 Supplier Manager</button></a>
 </div>
@@ -127,6 +137,7 @@ td{padding:10px;border-top:1px solid #e5e7eb}
 </div>
 </body>
 </html>
+
 """
 
 DASHBOARD_HTML = """
@@ -206,171 +217,235 @@ td{padding:14px;border-top:1px solid #ddd}
 </div></body></html>
 """
 
-SYSTEM_PROMPT = """
-You are Stocky, a friendly Filipino store assistant.
+REPORT_HTML = """
+<!doctype html><html><head>
+<title>Business Report</title>
+<style>
+body{font-family:Segoe UI;background:#f1f5f9;margin:0}
+.header{background:#065f46;color:white;padding:20px;font-size:22px}
+.container{padding:30px;max-width:1200px;margin:auto}
+.card{background:white;border-radius:16px;padding:25px;margin-bottom:20px;
+box-shadow:0 10px 30px rgba(0,0,0,.12)}
+table{width:100%;border-collapse:collapse;margin-top:10px}
+th,td{padding:10px;border-top:1px solid #ddd;text-align:left}
+button{padding:12px;border:none;border-radius:10px;background:#065f46;color:white;margin-right:10px}
+.scroll-box{max-height:300px;overflow-y:auto;}
+</style></head><body>
 
-Always output VALID JSON ONLY.
+<div class="header">📑 Daily & Weekly Business Report</div>
+<div class="container">
 
-Format:
-{"actions":[{"action":"add|sell|setmin|setcat|setsupplier",
-"item":"","qty":0,"price":0,"category":"","supplier":"","contact":"string or empty","reply":""}]}
+<div class="card">
+<h3>📊 Sales Summary</h3>
+<p>
+Today:
+{{ today_summary.qty if today_summary is defined else 0 }} items sold |
+₱{{ today_summary.sales if today_summary is defined else 0 }} sales |
+₱{{ today_summary.profit if today_summary is defined else 0 }} profit<br>
+This Week:
+{{ week_summary.qty if week_summary is defined else 0 }} items sold |
+₱{{ week_summary.sales if week_summary is defined else 0 }} sales |
+₱{{ week_summary.profit if week_summary is defined else 0 }} profit
+</p>
+</div>
+
+<div class="card">
+<h3>🔥 Top Selling Items (This Week)</h3>
+<table>
+<tr><th>Item</th><th>Qty Sold</th></tr>
+{% if week_summary is defined %}
+{% for i,q in week_summary.top_items %}
+<tr><td>{{ i }}</td><td>{{ q }}</td></tr>
+{% endfor %}
+{% endif %}
+</table>
+</div>
+
+<div class="card">
+<h3>📅 Today Transactions</h3>
+<div class="scroll-box">
+<table>
+<tr><th>Time</th><th>Item</th><th>Qty</th><th>Price</th></tr>
+{% if today is defined %}
+{% for h in today %}
+<tr><td>{{ h["time"] }}</td><td>{{ h["item"] }}</td><td>{{ h["qty"] }}</td><td>{{ h["price"] }}</td></tr>
+{% endfor %}
+{% endif %}
+</table>
+</div>
+</div>
+
+<div class="card">
+<h3>🗓 Weekly Transactions</h3>
+<div class="scroll-box">
+<table>
+<tr><th>Time</th><th>Item</th><th>Qty</th><th>Price</th></tr>
+{% if week is defined %}
+{% for h in week %}
+<tr><td>{{ h["time"] }}</td><td>{{ h["item"] }}</td><td>{{ h["qty"] }}</td><td>{{ h["price"] }}</td></tr>
+{% endfor %}
+{% endif %}
+</table>
+</div>
+</div>
+
+<a href="/export_report/xlsx"><button>⬇ Export Excel</button></a>
+<a href="/export_report/pdf"><button>⬇ Export PDF</button></a>
+<br><br>
+<a href="/"><button>⬅ Back</button></a>
+
+</div></body></html>
 """
 
+SYSTEM_PROMPT = """
+You are Stocky, a friendly inventory assistant.
+If user asks about stock quantity, return:
+{"actions":[{"action":"query","item":"coke","reply":"You have 10 bottles of coke left."}]}
+Return JSON only.
+"""
+
+# ---------- HELPERS ----------
 def load(p):
-    if not os.path.exists(p): return {} if p!=HISTORY_FILE else []
+    if not os.path.exists(p):
+        return {} if p!=HISTORY_FILE else []
     try: return json.load(open(p))
     except: return {} if p!=HISTORY_FILE else []
 
 def save(p,d):
     with open(p,"w") as f: json.dump(d,f,indent=2)
 
-def log(item,action,qty,price=0):
+def log(item,action,qty,price):
     hist=load(HISTORY_FILE)
-    hist.append({"time":str(datetime.datetime.now()),"item":item,"action":action,"qty":qty,"price":price})
+    hist.append({"time":str(datetime.datetime.now()),
+                 "item":item,"action":action,"qty":qty,"price":price})
     save(HISTORY_FILE,hist)
 
-def update_price(item, price, mode):
+def find_item(k,inv):
+    k=k.lower()
+    for i in inv:
+        if k in i.lower(): return i
+    return k
+
+def build_summary(hist,days):
+    now=datetime.datetime.now()
     prices=load(PRICE_FILE)
-    prices.setdefault(item,{"buy":0,"sell":0})
-    prices[item][mode]=price
-    save(PRICE_FILE,prices)
+    qty=sales=profit=0
+    counter=collections.Counter()
 
-def smart_reorder(inv,mins,hist):
-    recent={}
     for h in hist:
-        if h.get("action")=="OUT":
-            recent[h["item"]]=recent.get(h["item"],0)+h.get("qty",0)
-    return {i:max(5,recent[i]//7*10) for i,q in inv.items() if q<=mins.get(i,5) and i in recent}
+        try:
+            t=datetime.datetime.fromisoformat(h["time"].split('.')[0])
+            if h["action"]=="OUT" and (now-t).days<days:
+                qty+=h["qty"]
+                sales+=h["qty"]*h["price"]
+                buy=prices.get(h["item"],{}).get("buy",0)
+                profit+=(h["price"]-buy)*h["qty"]
+                counter[h["item"]]+=h["qty"]
+        except: pass
 
-def resolve_item_keyword(word,inventory):
-    word=word.lower()
-    matches=[i for i in inventory if i.lower().startswith(word)]
-    return matches[0] if matches else word
+    return {"qty":qty,"sales":sales,"profit":profit,
+            "top_items":counter.most_common(5)}
 
-def resolve_copy_commands(text,cats,sups):
-    text=text.lower()
-    acts=[]
-    def before(k): return text.split(k)[0].strip().split()[-1]
-    def after(k): return text.split(k)[1].strip().split()[0]
-
-    for k in ["same category as","same category with"]:
-        if k in text:
-            item,ref=before(k),after(k)
-            if ref in cats:
-                acts.append({"action":"setcat","item":item,"category":cats[ref],
-                "qty":0,"price":0,"supplier":"","contact":"",
-                "reply":f"{item} now uses same category as {ref}."})
-
-    for k in ["same supplier as","same supplier with"]:
-        if k in text:
-            item,ref=before(k),after(k)
-            if ref in sups:
-                acts.append({"action":"setsupplier","item":item,
-                "supplier":sups[ref]["name"],"contact":sups[ref].get("contact",""),
-                "qty":0,"price":0,"category":"",
-                "reply":f"{item} now uses same supplier as {ref}."})
-    return acts
-
-def detect_stock_query(text,inv):
-    text=text.lower()
-    patterns=[
-        r"how many\s+(\w+)",
-        r"(\w+)\s+left",
-        r"remaining\s+(\w+)",
-        r"stock\s+of\s+(\w+)",
-        r"(\w+)\?$"
-    ]
-    for p in patterns:
-        m=re.search(p,text)
-        if m:
-            key=m.group(1)
-            item=resolve_item_keyword(key,inv)
-            return item,inv.get(item,0)
-    return None,None
-
+# ---------- ROUTES ----------
 @app.route("/",methods=["GET","POST"])
 def home():
-    inv,mins,cats,sups,hist,prices=load(FILE),load(MIN_FILE),load(CAT_FILE),load(SUP_FILE),load(HISTORY_FILE),load(PRICE_FILE)
-    last_hist=hist[-15:]
+    inv,mins,cats,sups,prices,hist = load(FILE),load(MIN_FILE),load(CAT_FILE),load(SUP_FILE),load(PRICE_FILE),load(HISTORY_FILE)
     alerts=[i for i,q in inv.items() if q<=mins.get(i,5)]
-    reorders=smart_reorder(inv,mins,hist)
-    profit=sum((h["price"]-prices.get(h["item"],{}).get("buy",0))*h["qty"]
-        for h in hist if h.get("action")=="OUT")
+    profit=sum(h["qty"]*h["price"] for h in hist if h.get("action")=="OUT")
     reply=""
 
     if request.method=="POST":
-        text=request.form["msg"]
+        try:
+            ai=client.responses.create(model="gpt-4.1-mini",input=[
+                {"role":"system","content":SYSTEM_PROMPT},
+                {"role":"user","content":request.form["msg"]}
+            ]).output_text
+            data=json.loads(ai)
 
-        item,qty=detect_stock_query(text,inv)
-        if item:
-            reply=f"📦 You have {qty} stocks left for {item}."
-        else:
-            try:
-                copied=resolve_copy_commands(text,cats,sups)
-                ai=client.responses.create(model="gpt-4.1-mini",input=[
-                    {"role":"system","content":SYSTEM_PROMPT},
-                    {"role":"user","content":text}
-                ]).output_text
+            for d in data["actions"]:
+                item=find_item(d.get("item",""),inv)
+                if d["action"]=="query":
+                    reply=d.get("reply",f"You have {inv.get(item,0)} stocks of {item}.")
+                elif d["action"]=="add":
+                    inv[item]=inv.get(item,0)+d["qty"]
+                    prices.setdefault(item,{})["buy"]=d["price"]
+                    log(item,"IN",d["qty"],d["price"])
+                elif d["action"]=="sell":
+                    inv[item]=inv.get(item,0)-d["qty"]
+                    prices.setdefault(item,{})["sell"]=d["price"]
+                    log(item,"OUT",d["qty"],d["price"])
+                elif d["action"]=="remove":
+                    inv.pop(item,None); mins.pop(item,None)
 
-                data=json.loads(ai)
-                data["actions"]+=copied
+            save(FILE,inv); save(MIN_FILE,mins)
+            save(CAT_FILE,cats); save(SUP_FILE,sups); save(PRICE_FILE,prices)
 
-                for d in data["actions"]:
-                    if d.get("item"):
-                        d["item"]=resolve_item_keyword(d["item"],inv)
-
-                    if d["action"]=="add":
-                        inv[d["item"]]=inv.get(d["item"],0)+int(d["qty"])
-                        update_price(d["item"],d["price"],"buy")
-                        log(d["item"],"IN",d["qty"],d["price"])
-                    elif d["action"]=="sell":
-                        inv[d["item"]]=inv.get(d["item"],0)-int(d["qty"])
-                        update_price(d["item"],d["price"],"sell")
-                        log(d["item"],"OUT",d["qty"],d["price"])
-                    elif d["action"]=="setcat":
-                        cats[d["item"]]=d["category"]
-                    elif d["action"]=="setsupplier":
-                        sups[d["item"]]={"name":d.get("supplier",""),"contact":d.get("contact","")}
-
-                save(FILE,inv);save(MIN_FILE,mins);save(CAT_FILE,cats);save(SUP_FILE,sups)
-                reply=data["actions"][0]["reply"]
-            except:
-                reply="Try: coke left? or sold 2 cok"
+        except:
+            reply="❌ Try: how many coke left?"
 
     return render_template_string(MAIN_HTML,reply=reply,inventory=inv,
         min_levels=mins,categories=cats,suppliers=sups,
-        history=last_hist,alerts=alerts,reorders=reorders,profit=profit)
+        history=hist[-15:],alerts=alerts,reorders={},profit=profit)
 
 @app.route("/dashboard")
 def dashboard():
-    hist=load(HISTORY_FILE)
-    prices=load(PRICE_FILE)
+    hist=load(HISTORY_FILE); prices=load(PRICE_FILE)
     counter=collections.Counter(h["item"] for h in hist if h.get("action")=="OUT")
-    profit_table={}
-    price_list={}
+    profit_table={}; price_list={}
     for h in hist:
         if h.get("action")=="OUT":
-            i=h["item"]
-            profit_table.setdefault(i,{"qty":0,"profit":0})
-            buy=prices.get(i,{}).get("buy",0)
-            profit_table[i]["qty"]+=h["qty"]
-            profit_table[i]["profit"]+=(h["price"]-buy)*h["qty"]
-            price_list[i]=h["price"]
+            profit_table.setdefault(h["item"],{"qty":0,"profit":0})
+            profit_table[h["item"]]["qty"]+=h["qty"]
+            profit_table[h["item"]]["profit"]+=h["qty"]*h["price"]
+            price_list[h["item"]]=h["price"]
 
-    return render_template_string(
-    DASHBOARD_HTML,
-    top_items=counter.most_common(5),
-    monthly=len(hist),
-    turnover=sum(counter.values()),
-    profit_table=profit_table,
-    price_list=price_list,
-    prices=prices
-)
+    return render_template_string(DASHBOARD_HTML,
+        top_items=counter.most_common(5),
+        monthly=len(hist),
+        turnover=sum(counter.values()),
+        profit_table=profit_table,
+        price_list=price_list,
+        prices=prices)
 
+@app.route("/report")
+def report():
+    hist=load(HISTORY_FILE)
+    today=[]; week=[]; now=datetime.datetime.now()
+    for h in hist:
+        try:
+            t=datetime.datetime.fromisoformat(h["time"].split('.')[0])
+            if h["action"]=="OUT":
+                if (now-t).days<1: today.append(h)
+                if (now-t).days<7: week.append(h)
+        except: pass
+
+    return render_template_string(REPORT_HTML,today=today,week=week,
+        today_summary=build_summary(hist,1),
+        week_summary=build_summary(hist,7))
 
 @app.route("/suppliers")
 def suppliers():
     return render_template_string(SUPPLIER_HTML,suppliers=load(SUP_FILE))
 
+@app.route("/export_report/xlsx")
+def export_xlsx():
+    week=build_summary(load(HISTORY_FILE),7)
+    wb=Workbook(); ws=wb.active
+    ws.append(["Item","Qty Sold"])
+    for i,q in week["top_items"]: ws.append([i,q])
+    path=BASE+"weekly_sales.xlsx"; wb.save(path)
+    return send_file(path,as_attachment=True)
+
+@app.route("/export_report/pdf")
+def export_pdf():
+    week=build_summary(load(HISTORY_FILE),7)
+    rows=[["Item","Qty Sold"]]+week["top_items"]
+    doc=SimpleDocTemplate(BASE+"weekly_sales.pdf")
+    title=Paragraph("Jnel Bibingka & Food House Inc – Weekly Sales Report",
+                    getSampleStyleSheet()["Title"])
+    t=Table(rows); t.setStyle(TableStyle([('GRID',(0,0),(-1,-1),0.5,colors.black)]))
+    doc.build([title,t])
+    return send_file(BASE+"weekly_sales.pdf",as_attachment=True)
+
 if __name__=="__main__":
-    app.run(port=5000)
+    app.run(port=5000,debug=True)
